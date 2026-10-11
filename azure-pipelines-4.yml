@@ -1,0 +1,489 @@
+# ============================================================
+# VARISEN | TERRAFORM INFRASTRUCTURE PIPELINE
+# Azure DevOps | Terraform | DevSecOps | Cost | Approval | Apply
+# ============================================================
+
+trigger:
+  branches:
+    include:
+      - main
+      - feature/*
+
+pool:
+  name: varisen-agent  # Self-hosted agent to run pipeline tasks
+
+parameters:
+  - name: environmentName
+    displayName: Target Environment
+    type: string
+    default: dev
+    values:
+      - dev
+      - qa
+      - prod
+
+  - name: runTests
+    displayName: Run Security Scanners
+    type: boolean
+    default: true
+
+variables:
+  - group: VARISEN-TERRAFORM-PREPROD  # Centralized Terraform and Azure settings
+
+# ============================================================
+# STAGE 1 - TERRAFORM INIT AND VALIDATE
+# Init: Connects backend and downloads providers/modules.
+# Validate: Checks Terraform configuration syntax.
+# ============================================================
+
+stages:
+  - stage: terraforminitvalidate
+    displayName: 'Stage 1 | Terraform Init & Validate'
+    dependsOn: []
+    condition: always()
+
+    jobs:
+      - job: TerraformInitValidate
+        displayName: Terraform Init and Validate
+
+        steps:
+          - checkout: self  # Downloads repository code
+
+          - task: TerraformTask@5
+            displayName: '1.1 | Terraform Init'
+            inputs:
+              provider: azurerm
+              command: init
+              workingDirectory: '$(terraformWorkingDirectory)'
+              backendServiceArm: '$(azureServiceConnection)'
+              backendAzureRmResourceGroupName: '$(backendResourceGroup)'
+              backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+              backendAzureRmContainerName: '$(backendContainer)'
+              backendAzureRmKey: '$(backendKey)'
+
+          - task: TerraformTask@5
+            displayName: '1.2 | Terraform Validate'
+            inputs:
+              provider: azurerm
+              command: validate
+              workingDirectory: '$(terraformWorkingDirectory)'
+
+# ============================================================
+# STAGE 2 - SECURITY AND COMPLIANCE
+# TFSEC: Terraform security misconfigurations.
+# TFLint: Terraform configuration and provider issues.
+# Checkov: IaC security policies and compliance.
+# Gitleaks: Secrets exposed in Git history.
+# Trivy: Vulnerabilities, secrets and IaC misconfigurations.
+# Terrascan: IaC policy violations.
+# TruffleHog: Detects potentially exposed secrets.
+# Hard gates fail the pipeline; soft gates report warnings.
+# ============================================================
+
+  - stage: Security_Compliance
+    displayName: 'Stage 2 | Security & Compliance'
+    dependsOn: terraforminitvalidate
+    condition: and(succeeded(), eq('${{ parameters.runTests }}', 'true'))
+
+    jobs:
+      # TFSEC + TFLint: Security and configuration checks
+      - job: Security_TFSEC
+        displayName: '2.1 | TFSEC and TFLint'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+
+          - task: tfsec@1
+            displayName: '2.1.1 | TFSEC Security Scan'
+            inputs:
+              version: v1.26.0
+              dir: '$(terraformWorkingDirectory)'
+
+          - task: PowerShell@2
+            displayName: '2.1.2 | TFLint'
+            inputs:
+              targetType: inline
+              workingDirectory: '$(terraformWorkingDirectory)'
+              script: |
+                $ErrorActionPreference = 'Stop'
+
+                if (-not (Get-Command tflint -ErrorAction SilentlyContinue)) {
+                    throw 'TFLint is not installed or missing from PATH.'
+                }
+
+                tflint --init
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'TFLint initialization failed.'
+                }
+
+                tflint
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'TFLint reported violations.'
+                }
+
+      # Checkov: IaC security and compliance policies
+      - job: Policy_Checkov
+        displayName: '2.2 | Checkov Compliance'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: '2.2.1 | Checkov Scan'
+            inputs:
+              targetType: inline
+              workingDirectory: '$(terraformWorkingDirectory)'
+              script: |
+                $ErrorActionPreference = 'Stop'
+
+                if (-not (Get-Command checkov -ErrorAction SilentlyContinue)) {
+                    throw 'Checkov is not installed or missing from PATH.'
+                }
+
+                checkov -d . --enable-secret-scan-all-files --soft-fail
+
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host '##vso[task.logissue type=warning]Checkov returned a non-zero exit code.'
+                }
+
+      # Gitleaks: Hard gate for detected secrets
+      - job: Gitleaks
+        displayName: '2.3 | Gitleaks Secret Scan'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: PowerShell@2
+            displayName: '2.3.1 | Gitleaks Scan'
+            inputs:
+              targetType: inline
+              workingDirectory: '$(Build.SourcesDirectory)'
+              script: |
+                $ErrorActionPreference = 'Stop'
+
+                $cmd = Get-Command gitleaks -ErrorAction SilentlyContinue
+                if (-not $cmd) {
+                    throw 'Gitleaks is not installed or missing from PATH.'
+                }
+
+                $reportDir = "$(Build.ArtifactStagingDirectory)"
+                $reportPath = Join-Path $reportDir 'gitleaks-report.json'
+
+                New-Item -ItemType Directory -Force -Path $reportDir | Out-Null
+
+                & $cmd.Source git . `
+                  --report-format json `
+                  --report-path $reportPath `
+                  --redact
+
+                $scanExitCode = $LASTEXITCODE
+
+                if (-not (Test-Path $reportPath)) {
+                    '[]' | Set-Content -Path $reportPath -Encoding utf8
+                }
+
+                if ($scanExitCode -ne 0) {
+                    throw 'Gitleaks detected secrets or the scan failed.'
+                }
+
+                Write-Host 'Gitleaks scan passed.'
+
+          # Saves the scan report for later review
+          - task: PublishPipelineArtifact@1
+            displayName: '2.3.2 | Publish Gitleaks Report'
+            condition: always()
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)'
+              artifact: gitleaks-report
+              publishLocation: pipeline
+
+      # Trivy: Hard gate for HIGH/CRITICAL findings
+      - job: Trivy
+        displayName: '2.4 | Trivy Security Scan'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: '2.4.1 | Trivy Scan'
+            inputs:
+              targetType: inline
+              workingDirectory: '$(terraformWorkingDirectory)'
+              script: |
+                $ErrorActionPreference = 'Stop'
+
+                if (-not (Get-Command trivy -ErrorAction SilentlyContinue)) {
+                    throw 'Trivy is not installed or missing from PATH.'
+                }
+
+                trivy fs `
+                  --scanners misconfig,secret,vuln `
+                  --severity HIGH,CRITICAL `
+                  --exit-code 1 `
+                  .
+
+                if ($LASTEXITCODE -ne 0) {
+                    throw 'Trivy failed or detected HIGH/CRITICAL findings.'
+                }
+
+                Write-Host 'Trivy scan passed.'
+
+      # Terrascan: IaC policy scan; findings are warnings
+      - job: Terrascan
+        displayName: '2.5 | Terrascan IaC Scan'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: '2.5.1 | Terrascan Scan'
+            inputs:
+              targetType: inline
+              workingDirectory: '$(terraformWorkingDirectory)'
+              script: |
+                $ErrorActionPreference = 'Stop'
+
+                $cmd = Get-Command terrascan -ErrorAction SilentlyContinue
+
+                if (-not $cmd) {
+                    Write-Host '##vso[task.logissue type=warning]Terrascan is not installed. Scan skipped.'
+                    exit 0
+                }
+
+                & $cmd.Source scan -i terraform -d .
+                $scanExitCode = $LASTEXITCODE
+
+                if ($scanExitCode -ne 0) {
+                    Write-Host '##vso[task.logissue type=warning]Terrascan reported violations or encountered a scan error.'
+                } else {
+                    Write-Host 'Terrascan scan passed.'
+                }
+
+                exit 0
+
+      # TruffleHog: Git-history secret detection; findings are warnings
+      - job: TruffleHog
+        displayName: '2.6 | TruffleHog Secret Scan'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+            fetchDepth: 0
+
+          - task: PowerShell@2
+            displayName: '2.6.1 | TruffleHog Scan'
+            inputs:
+              targetType: inline
+              workingDirectory: '$(Build.SourcesDirectory)'
+              script: |
+                $ErrorActionPreference = 'Stop'
+
+                $cmd = Get-Command trufflehog -ErrorAction SilentlyContinue
+
+                if (-not $cmd) {
+                    Write-Host '##vso[task.logissue type=warning]TruffleHog is not installed. Scan skipped.'
+                    exit 0
+                }
+
+                & $cmd.Source git "file:///$(Build.SourcesDirectory)" --fail
+                $scanExitCode = $LASTEXITCODE
+
+                if ($scanExitCode -ne 0) {
+                    Write-Host '##vso[task.logissue type=warning]TruffleHog reported possible secrets or a scan error.'
+                } else {
+                    Write-Host 'TruffleHog scan passed.'
+                }
+
+                exit 0
+
+# ============================================================
+# STAGE 3 - INFRACOST
+# Estimates infrastructure cost before deployment.
+# ============================================================
+
+  - stage: CostAnalysis_Infracost
+    displayName: 'Stage 3 | Infracost Cost Analysis'
+    dependsOn: Security_Compliance
+    condition: succeeded()
+
+    jobs:
+      - job: Infracost
+        displayName: '3.1 | Cost Forecast'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+
+          - task: PowerShell@2
+            displayName: '3.1.1 | Infracost Breakdown'
+            continueOnError: true
+            inputs:
+              targetType: inline
+              workingDirectory: '$(terraformWorkingDirectory)'
+              script: |
+                $ErrorActionPreference = 'Continue'
+                Write-Host "Starting Infracost Breakdown..."
+                infracost breakdown --path .
+                if ($LASTEXITCODE -ne 0) { Write-Warning "Infracost failed. Continuing pipeline." }
+                Write-Host "Infracost step completed."
+
+                # $ErrorActionPreference = 'Stop'
+                # if (-not (Get-Command infracost -ErrorAction SilentlyContinue)) {
+                #     throw 'Infracost is not installed or missing from PATH.'
+                # }
+                # if (-not $env:INFRACOST_API_KEY) {
+                #     throw 'INFRACOST_API_KEY is not configured.'
+                # }
+                # infracost breakdown --path .
+                # if ($LASTEXITCODE -ne 0) {
+                #     throw 'Infracost breakdown failed.'
+                # }
+                # env:
+                #   INFRACOST_API_KEY: $(INFRACOST_API_KEY)
+
+
+# ============================================================
+# STAGE 4 - TERRAFORM PLAN
+# Calculates proposed infrastructure changes without applying.
+# Publishes the saved plan for approval and later deployment.
+# ============================================================
+
+  - stage: plan
+    displayName: 'Stage 4 | Terraform Plan'
+    dependsOn: CostAnalysis_Infracost
+    condition: succeeded()
+
+    jobs:
+      - job: TerraformPlan
+        displayName: '4.1 | Terraform Plan'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+
+          - task: TerraformTask@5
+            displayName: '4.1.1 | Terraform Init'
+            inputs:
+              provider: azurerm
+              command: init
+              workingDirectory: '$(terraformWorkingDirectory)'
+              backendServiceArm: '$(azureServiceConnection)'
+              backendAzureRmResourceGroupName: '$(backendResourceGroup)'
+              backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+              backendAzureRmContainerName: '$(backendContainer)'
+              backendAzureRmKey: '$(backendKey)'
+
+          - task: TerraformTask@5
+            displayName: '4.1.2 | Terraform Plan'
+            inputs:
+              provider: azurerm
+              command: plan
+              workingDirectory: '$(terraformWorkingDirectory)'
+              environmentServiceNameAzureRM: '$(azureServiceConnection)'
+              commandOptions: '-out="$(Build.ArtifactStagingDirectory)\tfplan"'
+
+          # Stores the exact plan file for the approval/apply stages
+          - task: PublishPipelineArtifact@1
+            displayName: '4.1.3 | Publish Reviewed Plan'
+            inputs:
+              targetPath: '$(Build.ArtifactStagingDirectory)\tfplan'
+              artifact: terraform-plan
+              publishLocation: pipeline
+
+# ============================================================
+# STAGE 5 - MANUAL APPROVAL
+# Pauses main-branch deployment until a reviewer approves.
+# ============================================================
+
+  - stage: MANUALVALIDATION
+    displayName: 'Stage 5 | Manual Approval'
+    dependsOn: plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+    jobs:
+      - job: ManualApproval
+        displayName: '5.1 | Awaiting Approval'
+        pool: server  # Runs on Azure DevOps server, not the agent
+        timeoutInMinutes: 1440
+
+        steps:
+          - task: ManualValidation@1
+            displayName: '5.1.1 | Manual Validation'
+            timeoutInMinutes: 720
+            inputs:
+              notifyUsers: 'pradum@varisen.com'
+              instructions: |
+                Review the pipeline before approving:
+
+                1. Confirm security scan results.
+                2. Review the Infracost estimate.
+                3. Review the Terraform plan artifact.
+                4. Confirm no unexpected resource deletions.
+                5. Verify the target environment and backend state.
+
+                Approve only after all checks pass.
+              onTimeout: reject
+
+# ============================================================
+# STAGE 6 - TERRAFORM APPLY
+# Main branch + approval required.
+# Applies the previously saved Terraform plan.
+# ============================================================
+
+  - stage: apply
+    displayName: 'Stage 6 | Terraform Apply'
+    dependsOn: MANUALVALIDATION
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+    jobs:
+      - job: TerraformApply
+        displayName: '6.1 | Apply Approved Plan'
+        pool:
+          name: varisen-agent
+
+        steps:
+          - checkout: self
+
+          # Downloads the plan reviewed in Stage 4
+          - task: DownloadPipelineArtifact@2
+            displayName: '6.1.1 | Download Approved Plan'
+            inputs:
+              buildType: current
+              artifactName: terraform-plan
+              targetPath: '$(Pipeline.Workspace)\terraform-plan'
+
+          - task: TerraformTask@5
+            displayName: '6.1.2 | Terraform Init'
+            inputs:
+              provider: azurerm
+              command: init
+              workingDirectory: '$(terraformWorkingDirectory)'
+              backendServiceArm: '$(azureServiceConnection)'
+              backendAzureRmResourceGroupName: '$(backendResourceGroup)'
+              backendAzureRmStorageAccountName: '$(backendStorageAccount)'
+              backendAzureRmContainerName: '$(backendContainer)'
+              backendAzureRmKey: '$(backendKey)'
+
+          # Applies the saved plan instead of generating a new one
+          - task: TerraformTask@5
+            displayName: '6.1.3 | Terraform Apply Approved Plan'
+            inputs:
+              provider: azurerm
+              command: apply
+              workingDirectory: '$(terraformWorkingDirectory)'
+              environmentServiceNameAzureRM: '$(azureServiceConnection)'
+              commandOptions: '"$(Pipeline.Workspace)\terraform-plan\tfplan"'
